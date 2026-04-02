@@ -20,6 +20,7 @@ import ipaddress
 import json
 import logging
 import random
+import re
 import signal
 import socket
 import struct
@@ -50,7 +51,7 @@ class ProxyConfig:
     port: int = 8899
     pool_size: int = 1000
     ipv6_prefix: str = 'fd00::'
-    interface: str = 'lo'  # 网卡接口
+    interface: Optional[str] = None  # 网卡接口，None表示自动检测
     max_connections_per_ip: int = 10
     connection_timeout: float = 30.0
     read_timeout: float = 60.0
@@ -124,7 +125,10 @@ class ConnectionStats:
 # ============== IPv6地址池 ==============
 
 def _get_global_ipv6_prefix(interface: str) -> Optional[str]:
-    """自动探测网卡上可路由的全球单播IPv6前缀（/64）"""
+    """自动探测网卡上可路由的全球单播IPv6前缀（/64）
+
+    注意：只返回GUA（Global Unicast Address），排除ULA（fc00::/7，如fd00::/8）
+    """
     try:
         result = subprocess.run(
             ['ip', '-6', 'addr', 'show', 'dev', interface],
@@ -138,14 +142,82 @@ def _get_global_ipv6_prefix(interface: str) -> Optional[str]:
                     if '/' in part:
                         try:
                             iface = ipaddress.ip_interface(part)
-                            if iface.ip.is_global:
+                            # 严格检查：必须是GUA，排除ULA和链路本地
+                            if iface.ip.is_global and not iface.ip.is_private:
                                 net = iface.network
                                 if net.prefixlen <= 64:
+                                    logger.info(f"检测到GUA前缀: {net.network_address}/64 来自 {part}")
                                     return f"{net.network_address}/64"
                         except ValueError:
                             continue
     except Exception as e:
         logger.warning(f"探测IPv6前缀失败: {e}")
+    return None
+
+
+def _get_default_ipv6_interface() -> Optional[str]:
+    """自动检测具有GUA地址的默认网络接口
+
+    优先顺序：
+    1. 检查默认路由的出接口
+    2. 遍历常见网卡名称，查找有GUA地址的接口
+    """
+    try:
+        # 方法1：从默认路由获取出接口
+        result = subprocess.run(
+            ['ip', '-6', 'route', 'show', 'default'],
+            capture_output=True, text=True, check=False
+        )
+        for line in result.stdout.splitlines():
+            # 格式: default via fe80:: dev eth0 metric 1024
+            if 'dev' in line:
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part == 'dev' and i + 1 < len(parts):
+                        iface = parts[i + 1]
+                        # 验证该接口是否有GUA地址
+                        if _get_global_ipv6_prefix(iface):
+                            logger.info(f"从默认路由检测到接口: {iface}")
+                            return iface
+
+        # 方法2：遍历常见网卡名称
+        common_interfaces = ['eth0', 'ens3', 'ens160', 'enp0s3', 'enp1s0',
+                            'en0', 'eno1', 'enp3s0', 'wlan0', 'wlp2s0']
+
+        for iface in common_interfaces:
+            if _get_global_ipv6_prefix(iface):
+                logger.info(f"从常见接口列表检测到: {iface}")
+                return iface
+
+        # 方法3：遍历所有接口查找有GUA的
+        result = subprocess.run(
+            ['ip', '-6', 'addr', 'show'],
+            capture_output=True, text=True, check=False
+        )
+        current_iface = None
+        for line in result.stdout.splitlines():
+            # 接口行格式: 2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> ...
+            if re.match(r'^\\d+:', line):
+                match = re.search(r'^\\d+:\\s+(\\w+):', line)
+                if match:
+                    current_iface = match.group(1)
+            # 检查是否有GUA地址
+            elif 'inet6' in line and 'scope global' in line:
+                parts = line.split()
+                for part in parts:
+                    if '/' in part:
+                        try:
+                            ip_iface = ipaddress.ip_interface(part)
+                            if ip_iface.ip.is_global and not ip_iface.ip.is_private:
+                                if current_iface and current_iface != 'lo':
+                                    logger.info(f"遍历检测到接口: {current_iface}")
+                                    return current_iface
+                        except ValueError:
+                            continue
+
+    except Exception as e:
+        logger.warning(f"自动检测默认接口失败: {e}")
+
     return None
 
 
@@ -157,26 +229,42 @@ class IPv6AddressPool:
     每个地址绑定到指定网卡，确保能作为合法源地址路由到公网。
     """
 
-    def __init__(self, prefix: str = 'fd00::', pool_size: int = 1000, interface: str = 'lo'):
-        self.interface = interface
+    def __init__(self, prefix: str = 'fd00::', pool_size: int = 1000, interface: Optional[str] = None):
         self.pool_size = pool_size
         self._available: List[str] = []
         self._in_use: Set[str] = set()
         self._lock = threading.Lock()
         self._setup_mode = False
 
+        # 自动检测接口（如果未指定）
+        if interface is None or interface == 'lo':
+            detected_iface = _get_default_ipv6_interface()
+            if detected_iface:
+                self.interface = detected_iface
+                logger.info(f"自动检测到IPv6接口: {self.interface}")
+            else:
+                self.interface = interface or 'lo'
+                if self.interface == 'lo':
+                    logger.warning(
+                        "未检测到具有公网IPv6(GUA)的网卡接口，回退到 'lo'。"
+                        "注意：lo接口通常没有GUA地址，外部连接可能会失败。"
+                        "请通过 --interface 指定正确的网卡（如 eth0, ens3）"
+                    )
+        else:
+            self.interface = interface
+
         # 自动探测真实前缀
         if prefix == 'fd00::' or not prefix:
-            detected = _get_global_ipv6_prefix(interface)
+            detected = _get_global_ipv6_prefix(self.interface)
             if detected:
                 logger.info(f"自动探测到IPv6前缀: {detected}，将基于此生成地址池")
                 self.prefix = detected
             else:
                 logger.warning(
-                    f"未在 {interface} 上探测到公网IPv6前缀(GUA)，回退到 {prefix}。"
+                    f"未在 {self.interface} 上探测到公网IPv6前缀(GUA)，回退到 {prefix}。"
                     f"注意：fd00:: 是ULA私有地址，无法直接路由到公网，"
                     f"外部目标会表现为连接超时或黑洞。如需使用公网IPv6，"
-                    f"请为 {interface} 配置全球单播地址，或通过 --ipv6-prefix 显式指定。"
+                    f"请为 {self.interface} 配置全球单播地址，或通过 --ipv6-prefix 显式指定。"
                 )
                 self.prefix = prefix
         else:
@@ -248,7 +336,13 @@ class IPv6AddressPool:
                 text=True,
                 check=False
             )
-            return result.returncode == 0 or 'File exists' in result.stderr
+            if result.returncode == 0 or 'File exists' in result.stderr:
+                return True
+
+            # 记录详细错误信息以便诊断
+            err_msg = result.stderr.strip() if result.stderr else "未知错误"
+            logger.warning(f"添加IP {ip}/128 到 {self.interface} 失败: {err_msg}")
+            return False
         except Exception as e:
             logger.warning(f"添加IP {ip} 到网卡失败: {e}")
             return False
@@ -270,13 +364,20 @@ class IPv6AddressPool:
     def acquire(self) -> Optional[str]:
         """获取一个可用的IPv6地址"""
         with self._lock:
+            failed_count = 0
             while self._available:
                 ip = self._available.pop(0)
                 if self._add_ip_to_interface(ip):
                     self._in_use.add(ip)
+                    if failed_count > 0:
+                        logger.warning(f"acquire: 跳过 {failed_count} 个无法添加的IP后，成功使用 {ip}")
                     return ip
                 else:
-                    logger.warning(f"acquire 时添加IP {ip} 失败，尝试下一个")
+                    failed_count += 1
+                    if failed_count <= 3:
+                        logger.warning(f"acquire: 添加IP {ip} 到网卡 {self.interface} 失败，尝试下一个")
+            if failed_count > 0:
+                logger.error(f"acquire: 地址池耗尽，共 {failed_count} 个IP无法添加到网卡")
             return None
 
     def release(self, ip: str):
@@ -403,7 +504,7 @@ class OutboundConnector:
 
     async def connect(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
         """
-        建立出站连接，优先尝试IPv6
+        建立出站连接，优先尝试IPv6（如果有GUA地址）
 
         Returns:
             (reader, writer, source_ip)
@@ -420,7 +521,15 @@ class OutboundConnector:
             # 缓存显示不支持IPv6，直接用IPv4
             return await self._connect_ipv4(host, port)
         else:
-            # 无缓存，优先尝试IPv6
+            # 无缓存，检查是否有可用IPv6地址
+            test_ip = self.ip_pool.acquire()
+            if test_ip is None:
+                # 没有可用的IPv6地址，直接使用IPv4
+                logger.debug(f"无可用IPv6地址，直接使用IPv4: {host}:{port}")
+                return await self._connect_ipv4(host, port)
+
+            # 有IPv6地址，优先尝试
+            self.ip_pool.release(test_ip)
             try:
                 return await self._try_ipv6_first(host, port)
             except Exception as e:
@@ -740,8 +849,16 @@ class HTTPProxyProtocol(asyncio.Protocol):
             logger.info(f"CONNECT [{used_ip}] -> {self.target_host}:{self.target_port} ({elapsed:.1f}ms)")
             self.stats.record_request(True, used_ip, f"{self.target_host}:{self.target_port}")
 
+        except asyncio.TimeoutError as e:
+            logger.error(f"CONNECT超时 {self.target_host}:{self.target_port}: {e}")
+            self.stats.record_request(False, self.used_ip or 'unknown', f"{self.target_host}:{self.target_port}")
+            self._send_error(504, f"Gateway Timeout: {e}")
+        except ConnectionError as e:
+            logger.error(f"CONNECT连接失败 {self.target_host}:{self.target_port}: {e}")
+            self.stats.record_request(False, self.used_ip or 'unknown', f"{self.target_host}:{self.target_port}")
+            self._send_error(502, f"Bad Gateway: {e}")
         except Exception as e:
-            logger.error(f"CONNECT失败 {self.target_host}:{self.target_port}: {e}")
+            logger.error(f"CONNECT失败 {self.target_host}:{self.target_port}: {e}", exc_info=True)
             self.stats.record_request(False, self.used_ip or 'unknown', f"{self.target_host}:{self.target_port}")
             self._send_error(502, f"Bad Gateway: {e}")
 
@@ -932,7 +1049,7 @@ class IPv6ProxyPoolServer:
         self.ip_pool = IPv6AddressPool(
             prefix=config.ipv6_prefix,
             pool_size=config.pool_size,
-            interface=getattr(config, 'interface', 'lo')
+            interface=config.interface
         )
         self.stats = ConnectionStats()
         self.connector = OutboundConnector(self.ip_pool, config, self.stats)
@@ -1015,12 +1132,22 @@ IPv6池大小: {self.config.pool_size}
 
 # ============== 系统配置辅助 ==============
 
-def setup_ipv6_addresses(count: int, interface: str = 'lo'):
+def setup_ipv6_addresses(count: int, interface: Optional[str] = None):
     """
     配置IPv6地址池到系统
 
     需要root权限运行。自动探测公网GUA前缀，探测不到则回退到 fd00::。
     """
+    # 自动检测接口
+    if interface is None:
+        detected = _get_default_ipv6_interface()
+        if detected:
+            interface = detected
+            print(f"自动检测到IPv6接口: {interface}")
+        else:
+            interface = 'lo'
+            print("警告: 未自动检测到具有GUA的接口，回退到 'lo'")
+
     prefix = _get_global_ipv6_prefix(interface)
     if prefix:
         print(f"检测到公网IPv6前缀: {prefix}，将基于此前缀生成地址池")
@@ -1076,8 +1203,18 @@ def setup_ipv6_addresses(count: int, interface: str = 'lo'):
     print(f"\n查看已配置地址: ip -6 addr show dev {interface}")
 
 
-def clear_ipv6_addresses(interface: str = 'lo'):
+def clear_ipv6_addresses(interface: Optional[str] = None):
     """清除自动配置的IPv6地址（包括 fd00:: 和探测到的公网前缀）"""
+    # 自动检测接口
+    if interface is None:
+        detected = _get_default_ipv6_interface()
+        if detected:
+            interface = detected
+            print(f"自动检测到IPv6接口: {interface}")
+        else:
+            interface = 'lo'
+            print("警告: 未自动检测到接口，回退到 'lo'")
+
     prefixes_to_clear = ['fd00::']
     detected = _get_global_ipv6_prefix(interface)
     if detected:
@@ -1155,7 +1292,7 @@ def main():
     parser.add_argument('--setup-ip', action='store_true', help='配置IPv6地址池到系统（需要root）')
     parser.add_argument('--clear-ip', action='store_true', help='清除配置的IPv6地址（需要root）')
     parser.add_argument('--ip-count', type=int, default=100, help='配置/清除的IP数量 (默认: 100)')
-    parser.add_argument('--interface', '-i', default='lo', help='网络接口 (默认: lo)')
+    parser.add_argument('--interface', '-i', default=None, help='网络接口 (默认: 自动检测)')
 
     args = parser.parse_args()
 
