@@ -16,6 +16,7 @@ IPv6出口代理池 - 高性能版
 
 import asyncio
 import argparse
+import ipaddress
 import json
 import logging
 import random
@@ -121,41 +122,125 @@ class ConnectionStats:
 
 # ============== IPv6地址池 ==============
 
+def _get_global_ipv6_prefix(interface: str) -> Optional[str]:
+    """自动探测网卡上可路由的全球单播IPv6前缀（/64）"""
+    try:
+        result = subprocess.run(
+            ['ip', '-6', 'addr', 'show', 'dev', interface],
+            capture_output=True, text=True, check=False
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if 'inet6' in line and 'scope global' in line:
+                parts = line.split()
+                for part in parts:
+                    if '/' in part:
+                        try:
+                            iface = ipaddress.ip_interface(part)
+                            if iface.ip.is_global:
+                                net = iface.network
+                                if net.prefixlen <= 64:
+                                    return f"{net.network_address}/64"
+                        except ValueError:
+                            continue
+    except Exception as e:
+        logger.warning(f"探测IPv6前缀失败: {e}")
+    return None
+
+
 class IPv6AddressPool:
     """
-    IPv6地址池管理器 - 即用即弃 + 动态配置模式
+    IPv6地址池管理器 - 基于真实可路由前缀
 
-    每个IP只用一次，用完立即从网卡删除并生成新IP添加
-    保持池子大小恒定，网卡上只保留当前可用的IP
+    自动探测网卡上的全球单播IPv6前缀(GUA)，在该前缀下生成地址池。
+    每个地址绑定到指定网卡，确保能作为合法源地址路由到公网。
     """
 
     def __init__(self, prefix: str = 'fd00::', pool_size: int = 1000, interface: str = 'lo'):
-        self.prefix = prefix
-        self.pool_size = pool_size
         self.interface = interface
+        self.pool_size = pool_size
         self._available: List[str] = []
         self._in_use: Set[str] = set()
         self._lock = threading.Lock()
-        self._setup_mode = False  # 是否由本类管理网卡配置
+        self._setup_mode = False
+
+        # 自动探测真实前缀
+        if prefix == 'fd00::' or not prefix:
+            detected = _get_global_ipv6_prefix(interface)
+            if detected:
+                logger.info(f"自动探测到IPv6前缀: {detected}，将基于此生成地址池")
+                self.prefix = detected
+            else:
+                logger.warning(
+                    f"未在 {interface} 上探测到公网IPv6前缀(GUA)，回退到 {prefix}。"
+                    f"注意：fd00:: 是ULA私有地址，无法直接路由到公网，"
+                    f"外部目标会表现为连接超时或黑洞。如需使用公网IPv6，"
+                    f"请为 {interface} 配置全球单播地址，或通过 --ipv6-prefix 显式指定。"
+                )
+                self.prefix = prefix
+        else:
+            self.prefix = prefix
+
         self._generate_pool()
+        self._install_pool_to_interface()
 
     def _generate_pool(self):
         """生成IPv6地址池"""
         for _ in range(self.pool_size):
             ip = self._generate_ip()
             self._available.append(ip)
-        logger.info(f"已生成 {self.pool_size} 个IPv6地址")
+        logger.info(f"已生成 {self.pool_size} 个IPv6地址，前缀: {self.prefix}")
 
     def _generate_ip(self) -> str:
-        """生成一个新的IPv6地址"""
-        suffix_parts = [f'{random.randint(0, 65535):04x}' for _ in range(4)]
-        suffix = ':'.join(suffix_parts)
-        return f"{self.prefix}{suffix}"
+        """基于前缀生成一个新的IPv6地址"""
+        try:
+            network = ipaddress.ip_network(self.prefix, strict=False)
+            prefix_len = network.prefixlen
+            if prefix_len >= 127:
+                host_bits = 128 - prefix_len
+                max_val = (1 << host_bits) - 2
+                offset = random.randint(1, max(1, max_val))
+                ip_int = int(network.network_address) + offset
+                return str(ipaddress.IPv6Address(ip_int))
+            else:
+                host = random.getrandbits(128 - prefix_len)
+                if host == 0:
+                    host = 1
+                mask = (1 << (128 - prefix_len)) - 1
+                ip_int = (int(network.network_address) & (~mask)) | (host & mask)
+                return str(ipaddress.IPv6Address(ip_int))
+        except Exception as e:
+            logger.warning(f"基于前缀生成地址失败: {e}，回退到简单拼接")
+            suffix_parts = [f'{random.randint(0, 65535):04x}' for _ in range(4)]
+            suffix = ':'.join(suffix_parts)
+            base = self.prefix.rstrip(':').rstrip('/')
+            return f"{base}::{suffix}"
+
+    def _install_pool_to_interface(self):
+        """将可用池中的地址批量添加到网卡"""
+        failed = 0
+        for ip in list(self._available):
+            if not self._add_ip_to_interface(ip):
+                self._available.remove(ip)
+                failed += 1
+        total = len(self._available)
+        if failed:
+            logger.warning(f"地址池初始化：{failed} 个地址添加到网卡失败，可用池: {total}")
+        logger.info(f"地址池初始化完成：{total}/{self.pool_size} 个地址已安装到 {self.interface}")
 
     def _add_ip_to_interface(self, ip: str) -> bool:
         """将IP添加到网卡"""
-        import subprocess
         try:
+            # 优先尝试 nodad 以跳过重复地址检测，加快可用
+            result = subprocess.run(
+                ['ip', '-6', 'addr', 'add', f'{ip}/128', 'dev', self.interface, 'nodad'],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode == 0 or 'File exists' in result.stderr:
+                return True
+            # 回退到标准模式（部分旧版 iproute 不支持 nodad）
             result = subprocess.run(
                 ['ip', '-6', 'addr', 'add', f'{ip}/128', 'dev', self.interface],
                 capture_output=True,
@@ -169,7 +254,6 @@ class IPv6AddressPool:
 
     def _remove_ip_from_interface(self, ip: str) -> bool:
         """从网卡删除IP"""
-        import subprocess
         try:
             result = subprocess.run(
                 ['ip', '-6', 'addr', 'del', f'{ip}/128', 'dev', self.interface],
@@ -185,11 +269,14 @@ class IPv6AddressPool:
     def acquire(self) -> Optional[str]:
         """获取一个可用的IPv6地址"""
         with self._lock:
-            if not self._available:
-                return None
-            ip = self._available.pop(0)
-            self._in_use.add(ip)
-            return ip
+            while self._available:
+                ip = self._available.pop(0)
+                if self._add_ip_to_interface(ip):
+                    self._in_use.add(ip)
+                    return ip
+                else:
+                    logger.warning(f"acquire 时添加IP {ip} 失败，尝试下一个")
+            return None
 
     def release(self, ip: str):
         """释放IPv6地址 - 即弃模式：从网卡删除旧IP，生成新IP并添加"""
@@ -198,7 +285,7 @@ class IPv6AddressPool:
                 self._in_use.discard(ip)
 
                 # 从网卡删除旧IP
-                if ip != '::' and not ip.startswith('0.0.'):
+                if ip != '::' and not ip.startswith('0.0.0.0') and not ip.startswith('0.0'):
                     self._remove_ip_from_interface(ip)
 
                 # 生成新IP
@@ -341,7 +428,7 @@ class OutboundConnector:
                 return await self._connect_ipv4(host, port)
 
     async def _try_ipv6_first(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
-        """优先尝试IPv6连接"""
+        """优先尝试IPv6连接，快速失败"""
         local_v6_addr = self.ip_pool.acquire()
         if not local_v6_addr:
             local_v6_addr = "::"
@@ -354,35 +441,27 @@ class OutboundConnector:
                     family=socket.AF_INET6,  # 只获取IPv6
                     type=socket.SOCK_STREAM
                 ),
-                timeout=5.0
+                timeout=3.0
             )
 
             if not addr_info:
                 raise ConnectionError(f"无IPv6地址: {host}")
 
-            # 尝试IPv6连接
+            # 尝试IPv6连接（短暂超时，避免黑洞等待）
             target_family, _, _, _, target_addr = addr_info[0]
             sock = self._create_ipv6_socket(local_v6_addr)
 
             try:
                 await asyncio.wait_for(
                     asyncio.get_event_loop().sock_connect(sock, target_addr),
-                    timeout=self.config.connection_timeout
+                    timeout=3.0
                 )
 
                 # IPv6连接成功，更新缓存
                 self._ipv6_cache.set(host, True)
 
                 # 包装为asyncio流
-                reader = asyncio.StreamReader(limit=self.config.buffer_size)
-                protocol = asyncio.StreamReaderProtocol(reader)
-                transport, _ = await asyncio.get_event_loop().connect_accepted_socket(
-                    lambda: protocol, sock
-                )
-                writer = asyncio.StreamWriter(
-                    transport, protocol, reader,
-                    asyncio.get_event_loop()
-                )
+                reader, writer = await asyncio.open_connection(sock=sock)
 
                 logger.debug(f"IPv6连接成功: [{local_v6_addr}] -> {host}:{port}")
                 return reader, writer, local_v6_addr
@@ -399,9 +478,7 @@ class OutboundConnector:
 
     async def _connect_ipv4(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
         """使用IPv4连接（回退方案）"""
-        # 获取IPv6地址用于显示（不实际使用）
-        local_v6_addr = self.ip_pool.acquire()
-        v6_display = local_v6_addr if local_v6_addr else "::"
+        v4_display = "0.0.0.0"
 
         try:
             # 获取IPv4地址信息
@@ -428,26 +505,14 @@ class OutboundConnector:
                 timeout=self.config.connection_timeout
             )
 
-            # IPv4连接成功，释放IPv6地址（未使用）
-            self.ip_pool.release(local_v6_addr)
-
             # 包装为asyncio流
-            reader = asyncio.StreamReader(limit=self.config.buffer_size)
-            protocol = asyncio.StreamReaderProtocol(reader)
-            transport, _ = await asyncio.get_event_loop().connect_accepted_socket(
-                lambda: protocol, sock
-            )
-            writer = asyncio.StreamWriter(
-                transport, protocol, reader,
-                asyncio.get_event_loop()
-            )
+            reader, writer = await asyncio.open_connection(sock=sock)
 
-            logger.debug(f"IPv4连接成功(回退): [{v6_display}] -> {host}:{port}")
-            # 返回IPv6地址用于日志显示（虽然实际走的是IPv4）
-            return reader, writer, v6_display
+            logger.debug(f"IPv4连接成功(回退): [{v4_display}] -> {host}:{port}")
+            return reader, writer, v4_display
 
         except Exception as e:
-            self.ip_pool.release(local_v6_addr)
+            sock.close()
             raise ConnectionError(f"连接失败 {host}:{port} - {e}")
 
     def _create_ipv6_socket(self, bind_addr: str) -> socket.socket:
@@ -764,7 +829,7 @@ class HTTPProxyProtocol(asyncio.Protocol):
         self.state = 'closed'
 
         # 释放IP
-        if self.used_ip and self.used_ip != '0.0.0.0':
+        if self.used_ip and self.used_ip not in ('0.0.0.0', '::'):
             self.connector.ip_pool.release(self.used_ip)
 
         # 关闭连接
@@ -953,17 +1018,42 @@ def setup_ipv6_addresses(count: int, interface: str = 'lo'):
     """
     配置IPv6地址池到系统
 
-    需要root权限运行
+    需要root权限运行。自动探测公网GUA前缀，探测不到则回退到 fd00::。
     """
-    import subprocess
+    prefix = _get_global_ipv6_prefix(interface)
+    if prefix:
+        print(f"检测到公网IPv6前缀: {prefix}，将基于此前缀生成地址池")
+    else:
+        prefix = 'fd00::/64'
+        print(f"警告: 未在 {interface} 上探测到公网IPv6前缀(GUA)。")
+        print(f"回退到私有前缀 {prefix}，该前缀无法路由到公网，仅适合本地测试。")
 
     print(f"正在配置 {count} 个IPv6地址到接口 {interface}...")
 
     configured = 0
     for i in range(count):
-        suffix_parts = [f'{random.randint(0, 65535):04x}' for _ in range(4)]
-        suffix = ':'.join(suffix_parts)
-        addr = f"fd00::{suffix}/128"
+        try:
+            network = ipaddress.ip_network(prefix, strict=False)
+            prefix_len = network.prefixlen
+            if prefix_len >= 127:
+                host_bits = 128 - prefix_len
+                max_val = (1 << host_bits) - 2
+                offset = random.randint(1, max(1, max_val))
+                ip_int = int(network.network_address) + offset
+                addr = str(ipaddress.IPv6Address(ip_int)) + '/128'
+            else:
+                host = random.getrandbits(128 - prefix_len)
+                if host == 0:
+                    host = 1
+                mask = (1 << (128 - prefix_len)) - 1
+                ip_int = (int(network.network_address) & (~mask)) | (host & mask)
+                addr = str(ipaddress.IPv6Address(ip_int)) + '/128'
+        except Exception as e:
+            print(f"生成地址失败: {e}，回退到简单模式")
+            suffix_parts = [f'{random.randint(0, 65535):04x}' for _ in range(4)]
+            suffix = ':'.join(suffix_parts)
+            base = prefix.rstrip(':').rstrip('/')
+            addr = f"{base}::{suffix}/128"
 
         try:
             result = subprocess.run(
@@ -974,9 +1064,6 @@ def setup_ipv6_addresses(count: int, interface: str = 'lo'):
             )
             if result.returncode == 0:
                 configured += 1
-            else:
-                # 可能已存在或其他错误
-                pass
         except Exception as e:
             print(f"错误: {e}")
             break
@@ -989,10 +1076,17 @@ def setup_ipv6_addresses(count: int, interface: str = 'lo'):
 
 
 def clear_ipv6_addresses(interface: str = 'lo'):
-    """清除fd00::开头的IPv6地址"""
-    import subprocess
+    """清除自动配置的IPv6地址（包括 fd00:: 和探测到的公网前缀）"""
+    prefixes_to_clear = ['fd00::']
+    detected = _get_global_ipv6_prefix(interface)
+    if detected:
+        try:
+            net = ipaddress.ip_network(detected, strict=False)
+            prefixes_to_clear.append(str(net.network_address))
+        except Exception:
+            pass
 
-    print(f"正在清除 {interface} 上的 fd00:: 地址...")
+    print(f"正在清除 {interface} 上的自动配置IPv6地址...")
 
     try:
         result = subprocess.run(
@@ -1002,18 +1096,19 @@ def clear_ipv6_addresses(interface: str = 'lo'):
             check=True
         )
 
-        for line in result.stdout.split('\n'):
-            if 'fd00::' in line:
-                parts = line.strip().split()
-                for part in parts:
-                    if part.startswith('fd00::'):
-                        addr = part.split('/')[0]
-                        subprocess.run(
-                            ['ip', '-6', 'addr', 'del', f'{addr}/128', 'dev', interface],
-                            capture_output=True,
-                            check=False
-                        )
-                        print(f"  已删除: {addr}")
+        for line in result.stdout.splitlines():
+            for prefix in prefixes_to_clear:
+                if prefix in line:
+                    parts = line.strip().split()
+                    for part in parts:
+                        if part.startswith(prefix):
+                            addr = part.split('/')[0]
+                            subprocess.run(
+                                ['ip', '-6', 'addr', 'del', f'{addr}/128', 'dev', interface],
+                                capture_output=True,
+                                check=False
+                            )
+                            print(f"  已删除: {addr}")
 
     except Exception as e:
         print(f"错误: {e}")

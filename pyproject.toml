@@ -24,7 +24,9 @@ classifiers = [
 ]
 
 # 核心依赖 - 仅标准库
-dependencies = []
+dependencies = [
+    "requests>=2.32.4",
+]
 
 [project.optional-dependencies]
 # 可选依赖 - 示例和测试使用
