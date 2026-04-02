@@ -560,13 +560,33 @@ class OutboundConnector:
             else:
                 sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
 
-            # 2. 随机化 TCP 窗口大小 (通过缓冲区大小间接控制)
-            win_size = random.randint(self.config.window_size_min, self.config.window_size_max)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, win_size)
-            # 禁用窗口缩放算法的某些自动行为，使初始窗口更符合预期（可选）
-            # sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, win_size)
+            # 2. 精准控制 TCP 窗口大小
+            # 目标窗口大小
+            target_win = random.randint(self.config.window_size_min, self.config.window_size_max)
+            
+            # 设置接收缓冲区。注意：Linux会翻倍SO_RCVBUF，且受tcp_adv_win_scale影响
+            # 我们设置一个足够大的值，确保缓冲区不会成为瓶颈
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, target_win * 2)
+            
+            # 使用 TCP_WINDOW_CLAMP 强制锁定通告窗口大小
+            # 这能直接控制外发 SYN 报文中的 Window 字段
+            if hasattr(socket, 'TCP_WINDOW_CLAMP'):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, target_win)
 
-            # 3. IPv6 特有：随机化 Flow Label
+            # 3. 随机化 MSS (Maximum Segment Size)
+            # 不同操作系统的初始 MSS 不同，这对于指纹识别非常重要
+            if hasattr(socket, 'TCP_MAXSEG'):
+                # 基础 MSS：IPv6 通常为 1440, IPv4 为 1460
+                base_mss = 1440 if family == socket.AF_INET6 else 1460
+                # 模拟略小的 MSS (如某些隧道或特定系统行为)
+                if random.random() > 0.7:
+                    custom_mss = base_mss - random.choice([0, 12, 20, 40])
+                    try:
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, custom_mss)
+                    except OSError:
+                        pass
+
+            # 4. IPv6 特有：随机化 Flow Label
             if family == socket.AF_INET6 and self.config.randomize_flow_label:
                 # Flow Label 是 20 位 (0 to 0xFFFFF)
                 flow_label = random.randint(1, 0xFFFFF)

@@ -40,4 +40,5 @@ env/
 Thumbs.db
 
 # uv
-uv.lock
+# uv.lock is recommended to be committed
+# uv.lock

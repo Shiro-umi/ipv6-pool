@@ -12,7 +12,7 @@
     - **指纹级转发**: 采用字节切片技术，完美保留原始 HTTP Header 的**顺序、大小写、空格排版及换行符**，确保在 Akamai/Cloudflare 等高级检测系统面前表现如真实浏览器。
 - **抗特征指纹**: 
     - **应用层**: 推荐配合 `curl_cffi` 使用，模拟真实浏览器 (Chrome/Safari) 的 TLS 握手 (JA3/JA4) 和 HTTP/2 指纹。
-    - **传输层 (TCP)**: 随机化 TCP 窗口大小 (Window Size)，模拟不同操作系统的初始握手特征。
+    - **传输层 (TCP)**: 使用 `TCP_WINDOW_CLAMP` 精准随机化外发 SYN 报文的窗口大小 (Window Size)，并支持 `TCP_MAXSEG` (MSS) 随机化，模拟不同操作系统的底层握手特征。
     - **网络层 (IP)**: 随机化 TTL / Hop Limit 以及 IPv6 Flow Label，防止通过协议栈识别代理服务器。
 - **访问控制 (ACL)**: 内置 IP 过滤机制，默认支持局域网白名单（192.168.x.x 等），防止代理被滥用。
 - **异常安全回收**: 完善的信号处理机制，确保在程序退出（Ctrl+C）或崩溃时，自动清理网卡上的所有临时 IPv6 地址。
@@ -34,22 +34,26 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 安装项目环境
+
+本中心建议使用 [uv](https://docs.astral.sh/uv/) 进行高效的环境管理：
 
 ```bash
-# 使用 uv 安装 (推荐)
+# 同步依赖并创建虚拟环境 (推荐)
 uv sync
-
-# 或者使用 pip
-pip install curl_cffi
 ```
 
 ### 2. 启动代理服务器 (需要 root 权限以管理网卡)
 
 ```bash
-# 启动代理，绑定端口 8899，建立 1000 个地址的 IP 池
-sudo uv run python ipv6_proxy_pool.py --port 8899 --pool-size 1000
+# 方式 A: 使用快速启动脚本 (推荐)
+sudo ./start.sh --port 8899 --pool-size 1000
+
+# 方式 B: 直接使用 uv 运行
+sudo uv run ipv6-proxy-pool --port 8899 --pool-size 1000
 ```
+
+> **注意**: 如果 `sudo` 找不到 `uv`，请尝试 `sudo -E uv run ...` 或使用 `sudo $(which uv) run ...`。
 
 ### 3. 编写抗探测爬虫 (Python 示例)
 
@@ -63,20 +67,19 @@ proxies = {
 
 # 使用 impersonate="chrome120" 完美模拟 Chrome 浏览器指纹
 response = requests.get(
-    "https://ja3er.com/json", 
+    "https://api64.ipify.org?format=json", 
     proxies=proxies,
     impersonate="chrome120",
     timeout=30
 )
 
-print(f"状态码: {response.status_code}")
-print(f"JA3 Hash: {response.json().get('ja3_hash')}")
+print(f"出口 IP: {response.json().get('ip')}")
 ```
 
 ## 命令行参数
 
-```
-python ipv6_proxy_pool.py [选项]
+```bash
+uv run ipv6-proxy-pool [选项]
 
 服务器选项:
   --host HOST           绑定地址 (默认: 0.0.0.0)
