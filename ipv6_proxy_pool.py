@@ -46,22 +46,27 @@ logger = logging.getLogger('ipv6_proxy_pool')
 @dataclass
 class ProxyConfig:
     """代理配置"""
-    host: str = '0.0.0.0'  # 默认绑定到所有接口，允许局域网访问
+    host: str = '0.0.0.0'
     port: int = 8899
     pool_size: int = 1000
-    ipv6_prefix: str = 'fd00::'
-    interface: Optional[str] = None  # 网卡接口，None表示自动检测
+    interface: Optional[str] = None
     max_connections_per_ip: int = 10
     connection_timeout: float = 30.0
     read_timeout: float = 60.0
-    rate_limit: int = 0  # 0表示不限速，每秒请求数
+    rate_limit: int = 0
     enable_stats: bool = True
     prefer_ipv6_target: bool = False
     buffer_size: int = 65536
     # 访问控制
-    allow_lan: bool = True  # 默认允许局域网访问
-    allowed_ips: Optional[List[str]] = None  # IP白名单
-    auth_token: Optional[str] = None  # 简单认证令牌
+    allow_lan: bool = True
+    allowed_ips: List[str] = field(default_factory=lambda: ['127.0.0.1', '192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12'])
+    # 指纹混淆配置
+    enable_fingerprint: bool = True
+    min_ttl: int = 64
+    max_ttl: int = 128
+    randomize_flow_label: bool = True
+    window_size_min: int = 65536
+    window_size_max: int = 131072
 
 
 # ============== 统计监控 ==============
@@ -123,11 +128,8 @@ class ConnectionStats:
 
 # ============== IPv6地址池 ==============
 
-def _get_global_ipv6_prefix(interface: str) -> Optional[str]:
-    """自动探测网卡上可路由的全球单播IPv6前缀（/64）
-
-    注意：只返回GUA（Global Unicast Address），排除ULA（fc00::/7，如fd00::/8）
-    """
+def _get_global_ipv6_prefix(interface: str) -> Optional[ipaddress.IPv6Network]:
+    """自动探测网卡上可路由的全球单播IPv6前缀及其掩码长度"""
     try:
         result = subprocess.run(
             ['ip', '-6', 'addr', 'show', 'dev', interface],
@@ -143,10 +145,8 @@ def _get_global_ipv6_prefix(interface: str) -> Optional[str]:
                             iface = ipaddress.ip_interface(part)
                             # 严格检查：必须是GUA，排除ULA和链路本地
                             if iface.ip.is_global and not iface.ip.is_private:
-                                net = iface.network
-                                if net.prefixlen <= 64:
-                                    logger.info(f"检测到GUA前缀: {net.network_address}/64 来自 {part}")
-                                    return f"{net.network_address}/64"
+                                logger.info(f"检测到GUA前缀: {iface.network} 来自 {part}")
+                                return iface.network
                         except ValueError:
                             continue
     except Exception as e:
@@ -223,206 +223,136 @@ def _get_default_ipv6_interface() -> Optional[str]:
 class IPv6AddressPool:
     """
     IPv6地址池管理器 - 基于真实可路由前缀
-
-    自动探测网卡上的全球单播IPv6前缀(GUA)，在该前缀下生成地址池。
-    每个地址绑定到指定网卡，确保能作为合法源地址路由到公网。
     """
 
-    def __init__(self, prefix: str = 'fd00::', pool_size: int = 1000, interface: Optional[str] = None):
+    def __init__(self, pool_size: int = 1000, interface: Optional[str] = None):
         self.pool_size = pool_size
         self._available: List[str] = []
         self._in_use: Set[str] = set()
+        self._all_generated: Set[str] = set()
         self._lock = asyncio.Lock()
-        self._setup_mode = False
 
-        # 自动检测接口（如果未指定）
+        # 1. 探测接口
         if interface is None or interface == 'lo':
-            detected_iface = _get_default_ipv6_interface()
-            if detected_iface:
-                self.interface = detected_iface
-                logger.info(f"自动检测到IPv6接口: {self.interface}")
-            else:
-                self.interface = interface or 'lo'
-                if self.interface == 'lo':
-                    logger.warning(
-                        "未检测到具有公网IPv6(GUA)的网卡接口，回退到 'lo'。"
-                        "注意：lo接口通常没有GUA地址，外部连接可能会失败。"
-                        "请通过 --interface 指定正确的网卡（如 eth0, ens3）"
-                    )
+            self.interface = _get_default_ipv6_interface() or 'lo'
         else:
             self.interface = interface
 
-        # 自动探测真实前缀
-        if prefix == 'fd00::' or not prefix:
-            detected = _get_global_ipv6_prefix(self.interface)
-            if detected:
-                logger.info(f"自动探测到IPv6前缀: {detected}，将基于此生成地址池")
-                self.prefix = detected
-            else:
-                logger.warning(
-                    f"未在 {self.interface} 上探测到公网IPv6前缀(GUA)，回退到 {prefix}。"
-                    f"注意：fd00:: 是ULA私有地址，无法直接路由到公网，"
-                    f"外部目标会表现为连接超时或黑洞。如需使用公网IPv6，"
-                    f"请为 {self.interface} 配置全球单播地址，或通过 --ipv6-prefix 显式指定。"
-                )
-                self.prefix = prefix
+        # 2. 探测前缀和掩码
+        network = _get_global_ipv6_prefix(self.interface)
+        if network:
+            self.network = network
+            logger.info(f"使用探测到的网络: {self.network}")
         else:
-            self.prefix = prefix
+            self.network = ipaddress.IPv6Network('fd00::/64')
+            logger.warning(f"未在 {self.interface} 探测到公网前缀，回退到私有网络: {self.network}")
 
+        # 3. 启动前强制清理（防止残留）
+        self._pre_startup_cleanup()
+
+        # 4. 生成并安装初始池
         self._generate_pool()
         self._install_pool_to_interface()
+
+    def _pre_startup_cleanup(self):
+        """启动前清理所有符合前缀的旧IP"""
+        try:
+            logger.info(f"正在清理接口 {self.interface} 上的旧IPv6地址...")
+            result = subprocess.run(
+                ['ip', '-6', 'addr', 'show', 'dev', self.interface],
+                capture_output=True, text=True, check=False
+            )
+            # 提取前缀部分进行匹配
+            base_prefix = str(self.network.network_address).split('::')[0]
+            count = 0
+            for line in result.stdout.splitlines():
+                if 'inet6' in line and base_prefix in line:
+                    parts = line.strip().split()
+                    for part in parts:
+                        if '/' in part and part.startswith(base_prefix):
+                            subprocess.run(['ip', '-6', 'addr', 'del', part, 'dev', self.interface], check=False)
+                            count += 1
+            if count > 0:
+                logger.info(f"已清理 {count} 个残留地址")
+        except Exception as e:
+            logger.debug(f"清理旧地址失败: {e}")
 
     def _generate_pool(self):
         """生成IPv6地址池"""
         for _ in range(self.pool_size):
             ip = self._generate_ip()
             self._available.append(ip)
-        logger.info(f"已生成 {self.pool_size} 个IPv6地址，前缀: {self.prefix}")
 
     def _generate_ip(self) -> str:
-        """基于前缀生成一个新的IPv6地址"""
-        try:
-            network = ipaddress.ip_network(self.prefix, strict=False)
-            prefix_len = network.prefixlen
-            if prefix_len >= 127:
-                host_bits = 128 - prefix_len
-                max_val = (1 << host_bits) - 2
-                offset = random.randint(1, max(1, max_val))
-                ip_int = int(network.network_address) + offset
-                return str(ipaddress.IPv6Address(ip_int))
-            else:
-                host = random.getrandbits(128 - prefix_len)
-                if host == 0:
-                    host = 1
-                mask = (1 << (128 - prefix_len)) - 1
-                ip_int = (int(network.network_address) & (~mask)) | (host & mask)
-                return str(ipaddress.IPv6Address(ip_int))
-        except Exception as e:
-            logger.warning(f"基于前缀生成地址失败: {e}，回退到简单拼接")
-            suffix_parts = [f'{random.randint(0, 65535):04x}' for _ in range(4)]
-            suffix = ':'.join(suffix_parts)
-            base = self.prefix.rstrip(':').rstrip('/')
-            return f"{base}::{suffix}"
+        """基于探测到的掩码长度生成一个新的IPv6地址"""
+        prefix_len = self.network.prefixlen
+        host_bits = 128 - prefix_len
+        host = random.getrandbits(host_bits)
+        if host == 0: host = 1
+        
+        ip_int = (int(self.network.network_address) & ~((1 << host_bits) - 1)) | (host & ((1 << host_bits) - 1))
+        ip_str = str(ipaddress.IPv6Address(ip_int))
+        self._all_generated.add(ip_str)
+        return ip_str
 
     def _install_pool_to_interface(self):
         """将可用池中的地址批量添加到网卡"""
-        failed = 0
         for ip in list(self._available):
             if not self._add_ip_to_interface_sync(ip):
                 self._available.remove(ip)
-                failed += 1
-        total = len(self._available)
-        if failed:
-            logger.warning(f"地址池初始化：{failed} 个地址添加到网卡失败，可用池: {total}")
-        logger.info(f"地址池初始化完成：{total}/{self.pool_size} 个地址已安装到 {self.interface}")
+        logger.info(f"地址池就绪：{len(self._available)}/{self.pool_size} 个地址已安装")
 
     def _add_ip_to_interface_sync(self, ip: str) -> bool:
-        """将IP添加到网卡（同步版本，请在执行器中调用）"""
         try:
-            # 优先尝试 nodad 以跳过重复地址检测，加快可用
+            addr = f"{ip}/{self.network.prefixlen}"
             result = subprocess.run(
-                ['ip', '-6', 'addr', 'add', f'{ip}/128', 'dev', self.interface, 'nodad'],
-                capture_output=True,
-                text=True,
-                check=False
+                ['ip', '-6', 'addr', 'add', addr, 'dev', self.interface, 'nodad'],
+                capture_output=True, check=False
             )
-            if result.returncode == 0 or 'File exists' in result.stderr:
-                return True
-            # 回退到标准模式（部分旧版 iproute 不支持 nodad）
-            result = subprocess.run(
-                ['ip', '-6', 'addr', 'add', f'{ip}/128', 'dev', self.interface],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            if result.returncode == 0 or 'File exists' in result.stderr:
-                return True
-
-            # 记录详细错误信息以便诊断
-            err_msg = result.stderr.strip() if result.stderr else "未知错误"
-            logger.warning(f"添加IP {ip}/128 到 {self.interface} 失败: {err_msg}")
-            return False
-        except Exception as e:
-            logger.warning(f"添加IP {ip} 到网卡失败: {e}")
+            return result.returncode == 0 or b'File exists' in result.stderr
+        except Exception:
             return False
 
     def _remove_ip_from_interface_sync(self, ip: str) -> bool:
-        """从网卡删除IP（同步版本，请在执行器中调用）"""
         try:
-            result = subprocess.run(
-                ['ip', '-6', 'addr', 'del', f'{ip}/128', 'dev', self.interface],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            return result.returncode == 0
-        except Exception as e:
-            logger.warning(f"从网卡删除IP {ip} 失败: {e}")
+            addr = f"{ip}/{self.network.prefixlen}"
+            subprocess.run(['ip', '-6', 'addr', 'del', addr, 'dev', self.interface], capture_output=True, check=False)
+            return True
+        except Exception:
             return False
 
     async def acquire(self) -> Optional[str]:
-        """获取一个可用的IPv6地址"""
-        loop = asyncio.get_running_loop()
+        """获取一个可用的IPv6地址（无需再次调用 subprocess，已预装）"""
         async with self._lock:
-            failed_count = 0
-            while self._available:
+            if self._available:
                 ip = self._available.pop(0)
-                success = await loop.run_in_executor(None, self._add_ip_to_interface_sync, ip)
-                if success:
-                    self._in_use.add(ip)
-                    if failed_count > 0:
-                        logger.warning(f"acquire: 跳过 {failed_count} 个无法添加的IP后，成功使用 {ip}")
-                    return ip
-                else:
-                    failed_count += 1
-                    if failed_count <= 3:
-                        logger.warning(f"acquire: 添加IP {ip} 到网卡 {self.interface} 失败，尝试下一个")
-            if failed_count > 0:
-                logger.error(f"acquire: 地址池耗尽，共 {failed_count} 个IP无法添加到网卡")
+                self._in_use.add(ip)
+                return ip
             return None
 
     async def release(self, ip: Optional[str]):
-        """释放IPv6地址 - 即弃模式：从网卡删除旧IP，生成新IP并添加"""
-        if not ip or ip == '::' or ip.startswith('0.0.0.0') or ip.startswith('0.0'):
-            return
+        """释放并汰换地址（即用即弃）"""
+        if not ip or ip in ('::', '0.0.0.0'): return
 
         loop = asyncio.get_running_loop()
         async with self._lock:
-            if ip not in self._in_use:
-                return
-            self._in_use.discard(ip)
-
-            # 从网卡删除旧IP
-            await loop.run_in_executor(None, self._remove_ip_from_interface_sync, ip)
-
-            # 生成新IP
-            new_ip = self._generate_ip()
-
-            # 将新IP添加到网卡
-            success = await loop.run_in_executor(None, self._add_ip_to_interface_sync, new_ip)
-            if success:
-                self._available.append(new_ip)
-                logger.debug(f"IP汰换: {ip} -> {new_ip}")
-            else:
-                # 如果添加失败，尝试生成另一个
-                logger.warning(f"添加新IP失败，尝试另一个...")
-                replaced = False
-                for _ in range(5):  # 最多尝试5次
-                    new_ip = self._generate_ip()
-                    success = await loop.run_in_executor(None, self._add_ip_to_interface_sync, new_ip)
-                    if success:
-                        self._available.append(new_ip)
-                        logger.debug(f"IP汰换: {ip} -> {new_ip} (重试)")
-                        replaced = True
-                        break
-                if not replaced:
-                    logger.error(f"IP汰换失败: {ip} 释放后无法生成有效新IP，地址池永久缩小")
+            if ip in self._in_use:
+                self._in_use.discard(ip)
+                # 异步执行耗时的网卡操作
+                await loop.run_in_executor(None, self._remove_ip_from_interface_sync, ip)
+                
+                # 汰换：生成并安装新IP
+                new_ip = self._generate_ip()
+                if await loop.run_in_executor(None, self._add_ip_to_interface_sync, new_ip):
+                    self._available.append(new_ip)
+                    logger.debug(f"IP汰换: {ip} -> {new_ip}")
 
     async def cleanup(self):
-        """清理所有已安装到网卡的IP"""
+        """清理所有已安装到网卡的IP (包括曾生成的所有IP)"""
         loop = asyncio.get_running_loop()
         async with self._lock:
-            total_to_remove = list(self._available) + list(self._in_use)
+            # 使用 _all_generated 确保即使地址不在可用/在用池中也能被清理
+            total_to_remove = list(self._all_generated)
             if not total_to_remove:
                 return
 
@@ -434,6 +364,7 @@ class IPv6AddressPool:
 
             self._available.clear()
             self._in_use.clear()
+            self._all_generated.clear()
             logger.info(f"清理完成: 成功删除 {removed}/{len(total_to_remove)} 个地址")
 
     def get_stats(self) -> dict:
@@ -529,129 +460,126 @@ class OutboundConnector:
         self._ipv6_cache = IPv6ConnectivityCache(maxsize=1024, ttl=300)  # 5分钟缓存
 
     async def connect(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
-        """
-        建立出站连接，优先尝试IPv6（如果有GUA地址）
-
-        Returns:
-            (reader, writer, source_ip)
-        """
+        """建立出站连接，支持智能双栈 A/AAAA 选择"""
         await self.rate_limiter.wait()
 
-        # 检查缓存
-        cached_result = self._ipv6_cache.get(host)
-
-        if cached_result is True:
-            # 缓存显示支持IPv6，直接尝试
-            return await self._try_ipv6_first(host, port)
-        elif cached_result is False:
-            # 缓存显示不支持IPv6，直接用IPv4
-            return await self._connect_ipv4(host, port)
-        else:
-            # 无缓存，检查是否有可用IPv6地址
-            test_ip = await self.ip_pool.acquire()
-            if test_ip is None:
-                # 没有可用的IPv6地址，直接使用IPv4
-                logger.debug(f"无可用IPv6地址，直接使用IPv4: {host}:{port}")
-                return await self._connect_ipv4(host, port)
-
-            # 有IPv6地址，优先尝试
-            await self.ip_pool.release(test_ip)
-            try:
-                return await self._try_ipv6_first(host, port)
-            except Exception as e:
-                # IPv6失败，回退到IPv4
-                logger.debug(f"IPv6连接失败，回退到IPv4: {host}:{port} - {e}")
-                return await self._connect_ipv4(host, port)
-
-    async def _try_ipv6_first(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
-        """优先尝试IPv6连接，快速失败"""
-        local_v6_addr = await self.ip_pool.acquire()
-        if not local_v6_addr:
-            local_v6_addr = "::"
-
+        # 解析目标地址（支持IPv4和IPv6）
         try:
-            # 获取IPv6地址信息
             addr_info = await asyncio.wait_for(
                 asyncio.get_running_loop().getaddrinfo(
                     host, port,
-                    family=socket.AF_INET6,  # 只获取IPv6
-                    type=socket.SOCK_STREAM
-                ),
-                timeout=3.0
-            )
-
-            if not addr_info:
-                raise ConnectionError(f"无IPv6地址: {host}")
-
-            # 尝试IPv6连接（短暂超时，避免黑洞等待）
-            target_family, _, _, _, target_addr = addr_info[0]
-            sock = self._create_ipv6_socket(local_v6_addr)
-
-            try:
-                await asyncio.wait_for(
-                    asyncio.get_running_loop().sock_connect(sock, target_addr),
-                    timeout=3.0
-                )
-
-                # IPv6连接成功，更新缓存
-                self._ipv6_cache.set(host, True)
-
-                # 包装为asyncio流
-                reader, writer = await asyncio.open_connection(sock=sock)
-
-                logger.debug(f"IPv6连接成功: [{local_v6_addr}] -> {host}:{port}")
-                return reader, writer, local_v6_addr
-
-            except Exception as e:
-                sock.close()
-                raise
-
-        except Exception as e:
-            await self.ip_pool.release(local_v6_addr)
-            # IPv6失败，记录缓存并抛出让上层回退
-            self._ipv6_cache.set(host, False)
-            raise
-
-    async def _connect_ipv4(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
-        """使用IPv4连接（回退方案）"""
-        v4_display = "0.0.0.0"
-        sock = None
-
-        try:
-            # 获取IPv4地址信息
-            addr_info = await asyncio.wait_for(
-                asyncio.get_running_loop().getaddrinfo(
-                    host, port,
-                    family=socket.AF_INET,  # 只获取IPv4
+                    family=socket.AF_UNSPEC, # 获取所有可用记录
                     type=socket.SOCK_STREAM
                 ),
                 timeout=5.0
             )
+        except Exception as e:
+            raise ConnectionError(f"DNS解析失败 {host}: {e}")
 
-            if not addr_info:
-                raise ConnectionError(f"DNS解析失败: {host}")
+        if not addr_info:
+            raise ConnectionError(f"无法解析地址: {host}")
 
-            target_family, _, _, _, target_addr = addr_info[0]
+        # 根据配置偏好排序 addr_info
+        # 如果 prefer_ipv6_target 为 True，将 IPv6 放在前面
+        if self.config.prefer_ipv6_target:
+            v6_targets = [a for a in addr_info if a[0] == socket.AF_INET6]
+            v4_targets = [a for a in addr_info if a[0] == socket.AF_INET]
+            addr_info = v6_targets + v4_targets
+        else:
+            # 默认：如果 IPv6 连接缓存成功过，则优先 IPv6
+            cached = self._ipv6_cache.get(host)
+            if cached:
+                v6_targets = [a for a in addr_info if a[0] == socket.AF_INET6]
+                v4_targets = [a for a in addr_info if a[0] == socket.AF_INET]
+                addr_info = v6_targets + v4_targets
 
-            # 创建IPv4 socket
-            sock = self._create_ipv4_socket()
+        # 尝试连接列表中的目标
+        last_err = None
+        for family, _, _, _, target_addr in addr_info:
+            try:
+                if family == socket.AF_INET6:
+                    return await self._connect_ipv6_single(host, port, target_addr)
+                else:
+                    return await self._connect_ipv4_single(host, port, target_addr)
+            except Exception as e:
+                last_err = e
+                continue
+        
+        raise ConnectionError(f"所有地址连接均失败: {last_err}")
 
-            # 连接目标
+    async def _connect_ipv6_single(self, host: str, port: int, target_addr) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
+        """单次IPv6连接尝试"""
+        local_v6_addr = await self.ip_pool.acquire()
+        if not local_v6_addr:
+            raise ConnectionError("IPv6池已耗尽")
+
+        sock = None
+        try:
+            sock = self._create_ipv6_socket(local_v6_addr)
             await asyncio.wait_for(
                 asyncio.get_running_loop().sock_connect(sock, target_addr),
                 timeout=self.config.connection_timeout
             )
-
-            # 包装为asyncio流
+            
+            self._ipv6_cache.set(host, True)
             reader, writer = await asyncio.open_connection(sock=sock)
+            logger.debug(f"IPv6连接成功: [{local_v6_addr}] -> {host}:{port}")
+            return reader, writer, local_v6_addr
+        except Exception as e:
+            if sock: sock.close()
+            await self.ip_pool.release(local_v6_addr)
+            self._ipv6_cache.set(host, False)
+            raise
 
-            logger.debug(f"IPv4连接成功(回退): [{v4_display}] -> {host}:{port}")
-            return reader, writer, v4_display
+    async def _connect_ipv4_single(self, host: str, port: int, target_addr) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
+        """单次IPv4连接尝试"""
+        sock = None
+        try:
+            sock = self._create_ipv4_socket()
+            await asyncio.wait_for(
+                asyncio.get_running_loop().sock_connect(sock, target_addr),
+                timeout=self.config.connection_timeout
+            )
+            reader, writer = await asyncio.open_connection(sock=sock)
+            logger.debug(f"IPv4连接成功: [0.0.0.0] -> {host}:{port}")
+            return reader, writer, "0.0.0.0"
+        except Exception as e:
+            if sock: sock.close()
+            raise
+
+    def _apply_fingerprint(self, sock: socket.socket, family: int):
+        """应用TCP/IP指纹混淆"""
+        if not self.config.enable_fingerprint:
+            return
+
+        try:
+            # 1. 随机化 TTL / Hop Limit
+            ttl = random.randint(self.config.min_ttl, self.config.max_ttl)
+            if family == socket.AF_INET:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+            else:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
+
+            # 2. 随机化 TCP 窗口大小 (通过缓冲区大小间接控制)
+            win_size = random.randint(self.config.window_size_min, self.config.window_size_max)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, win_size)
+            # 禁用窗口缩放算法的某些自动行为，使初始窗口更符合预期（可选）
+            # sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, win_size)
+
+            # 3. IPv6 特有：随机化 Flow Label
+            if family == socket.AF_INET6 and self.config.randomize_flow_label:
+                # Flow Label 是 20 位 (0 to 0xFFFFF)
+                flow_label = random.randint(1, 0xFFFFF)
+                # IPv6 Flow Info 结构通常包含: flow_label (20 bits), traffic_class (8 bits)
+                # 在 Linux setsockopt 中，可以直接设置
+                try:
+                    # 注意：某些系统可能需要特定格式或权限
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_FLOWINFO, flow_label)
+                except OSError:
+                    pass # 某些内核版本可能不支持直接修改
 
         except Exception as e:
-            if sock:
-                sock.close()
-            raise ConnectionError(f"连接失败 {host}:{port} - {e}")
+            logger.debug(f"应用指纹混淆失败: {e}")
 
     def _create_ipv6_socket(self, bind_addr: str) -> socket.socket:
         """创建IPv6 socket并绑定到指定地址"""
@@ -665,6 +593,9 @@ class OutboundConnector:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         except:
             pass
+
+        # 应用指纹
+        self._apply_fingerprint(sock, socket.AF_INET6)
 
         try:
             sock.bind((bind_addr, 0, 0, 0))
@@ -684,6 +615,9 @@ class OutboundConnector:
         sock.setblocking(False)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        # 应用指纹
+        self._apply_fingerprint(sock, socket.AF_INET)
 
         try:
             sock.bind(("0.0.0.0", 0))
@@ -724,64 +658,37 @@ class HTTPProxyProtocol(asyncio.Protocol):
     def connection_made(self, transport: asyncio.Transport):
         self.transport = transport
         self.peername = transport.get_extra_info('peername')
-
-        # 访问控制检查
-        if not self._check_access():
-            client_ip = self.peername[0] if self.peername else 'unknown'
-            logger.warning(f"拒绝连接: {client_ip}")
-            self._send_error(403, "Forbidden")
+        
+        # 访问控制校验
+        if not self._is_client_allowed():
+            logger.warning(f"拒绝未授权访问: {self.peername}")
+            self.transport.close()
             return
 
         self.stats.connection_started()
         logger.debug(f"客户端连接: {self.peername}")
 
-    def _check_access(self) -> bool:
-        """检查客户端是否有权限访问"""
-        if not self.peername:
-            return False
-
-        client_ip = self.peername[0]
-
-        # 本地连接总是允许
-        if client_ip in ('127.0.0.1', '::1', 'localhost'):
-            return True
-
-        # 如果允许局域网
-        if self.config.allow_lan:
-            # 检查是否是局域网IP
-            if self._is_lan_ip(client_ip):
-                return True
-
-        # 检查白名单
-        if self.config.allowed_ips:
-            if client_ip in self.config.allowed_ips:
-                return True
-            # 支持CIDR格式
-            for allowed in self.config.allowed_ips:
-                if '/' in allowed and self._ip_in_cidr(client_ip, allowed):
+    def _is_client_allowed(self) -> bool:
+        """检查客户端IP是否在允许范围内"""
+        if not self.peername: return False
+        client_ip = ipaddress.ip_address(self.peername[0])
+        
+        # 本地回环始终允许
+        if client_ip.is_loopback: return True
+        
+        # 检查允许列表
+        for allowed in self.config.allowed_ips:
+            try:
+                if client_ip in ipaddress.ip_network(allowed):
                     return True
-
+            except ValueError:
+                continue
+        
+        # 检查局域网
+        if self.config.allow_lan and client_ip.is_private:
+            return True
+            
         return False
-
-    def _is_lan_ip(self, ip: str) -> bool:
-        """检查IP是否是局域网地址"""
-        try:
-            import ipaddress
-            addr = ipaddress.ip_address(ip)
-            # 私有地址范围
-            return addr.is_private
-        except:
-            return False
-
-    def _ip_in_cidr(self, ip: str, cidr: str) -> bool:
-        """检查IP是否在CIDR网段内"""
-        try:
-            import ipaddress
-            addr = ipaddress.ip_address(ip)
-            network = ipaddress.ip_network(cidr, strict=False)
-            return addr in network
-        except:
-            return False
 
     def data_received(self, data: bytes):
         """接收客户端数据"""
@@ -816,6 +723,8 @@ class HTTPProxyProtocol(asyncio.Protocol):
 
     def _handle_request(self, header_data: bytes, body_data: bytes):
         """处理HTTP请求"""
+        # TODO: 下一个任务详细讨论：保持原始 Header 顺序及其完整性保护
+        # 针对 Akamai/Cloudflare 的指纹识别优化，应使用原始 buffer 进行切片转发
         try:
             lines = header_data.split(b'\r\n')
             request_line = lines[0].decode('utf-8', errors='ignore')
@@ -895,7 +804,7 @@ class HTTPProxyProtocol(asyncio.Protocol):
             self._send_error(502, f"Bad Gateway: {e}")
 
     async def _handle_http_request(self, method: str, parsed, header_data: bytes, body_data: bytes):
-        """处理普通HTTP请求"""
+        """处理普通HTTP请求 - 完美保留原始Header指纹"""
         try:
             reader, writer, used_ip = await self.connector.connect(
                 self.target_host, self.target_port
@@ -903,27 +812,48 @@ class HTTPProxyProtocol(asyncio.Protocol):
             self.outbound_writer = writer
             self.used_ip = used_ip
 
-            # 重构请求
-            path = parsed.path or '/'
+            # 1. 提取路径和查询字符串
+            path_bytes = (parsed.path or '/').encode()
             if parsed.query:
-                path += '?' + parsed.query
+                path_bytes += b'?' + parsed.query.encode()
 
+            # 2. 处理请求行 (Request Line)
+            # 找到第一行结束位置
+            first_line_end = header_data.find(b'\r\n')
+            if first_line_end == -1:
+                first_line_end = header_data.find(b'\n')
+            
+            # 分割请求行：METHOD URL VERSION
+            request_line = header_data[:first_line_end]
+            parts = request_line.split(b' ')
+            
+            # 将绝对URL替换为路径（例如: GET http://host/path -> GET /path）
+            # 注意保持原始 METHOD 和 HTTP 版本字段的字节，防止大小写异常
+            if len(parts) >= 3:
+                # 重新构建请求行: [METHOD] [PATH] [VERSION]
+                new_request_line = parts[0] + b' ' + path_bytes + b' ' + parts[2]
+            else:
+                new_request_line = request_line
+
+            # 3. 过滤并转发后续 Header (保持原始字节细节)
             lines = header_data.split(b'\r\n')
-            new_request = f"{method} {path} HTTP/1.1\r\n".encode()
-
-            # 转发头（去除代理相关头）
+            if len(lines) == 1 and b'\n' in header_data: # 可能是 \n 换行
+                lines = header_data.split(b'\n')
+            
+            new_header_buffer = new_request_line + b'\r\n'
+            
+            # 从第二行（Header开始）进行过滤
             for line in lines[1:]:
-                if line:
-                    lower_line = line.lower()
-                    if not lower_line.startswith(b'proxy-'):
-                        new_request += line + b'\r\n'
-
-            new_request += b'\r\n'
-
-            # 发送请求
-            writer.write(new_request + body_data)
+                if not line: continue
+                # 仅过滤代理相关头，保持其它所有头（包括大小写和空格）不变
+                if not line.lower().startswith(b'proxy-'):
+                    new_header_buffer += line + b'\r\n'
+            
+            # 4. 发送完整请求
+            new_header_buffer += b'\r\n'
+            writer.write(new_header_buffer + body_data)
             await writer.drain()
-            self.bytes_sent += len(new_request) + len(body_data)
+            self.bytes_sent += len(new_header_buffer) + len(body_data)
 
             self.state = 'relaying'
             self.buffer = b''
@@ -932,7 +862,7 @@ class HTTPProxyProtocol(asyncio.Protocol):
             asyncio.create_task(self._relay_responses(reader))
 
             elapsed = (time.time() - self.start_time) * 1000
-            logger.info(f"HTTP [{used_ip}] -> {self.target_host}:{self.target_port}{path} ({elapsed:.1f}ms)")
+            logger.info(f"HTTP [{used_ip}] -> {self.target_host}:{self.target_port}{path_bytes.decode()} ({elapsed:.1f}ms)")
             self.stats.record_request(True, used_ip, f"{self.target_host}:{self.target_port}")
 
         except Exception as e:
@@ -1079,7 +1009,6 @@ class IPv6ProxyPoolServer:
     def __init__(self, config: ProxyConfig):
         self.config = config
         self.ip_pool = IPv6AddressPool(
-            prefix=config.ipv6_prefix,
             pool_size=config.pool_size,
             interface=config.interface
         )
@@ -1093,31 +1022,41 @@ class IPv6ProxyPoolServer:
 
     async def start(self):
         """启动服务器"""
-        loop = asyncio.get_running_loop()
+        try:
+            loop = asyncio.get_running_loop()
 
-        # 设置信号处理
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._signal_handler)
+            # 设置信号处理
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self._signal_handler)
 
-        # 启动代理服务器
-        self.proxy_server = await loop.create_server(
-            lambda: HTTPProxyProtocol(self.connector, self.stats, self.config),
-            self.config.host,
-            self.config.port,
-            reuse_address=True,
-            reuse_port=True
-        )
+            # 启动代理服务器
+            self.proxy_server = await loop.create_server(
+                lambda: HTTPProxyProtocol(self.connector, self.stats, self.config),
+                self.config.host,
+                self.config.port,
+                reuse_address=True,
+                reuse_port=True
+            )
 
-        # 启动管理服务器
-        self.mgmt_server = ManagementServer(self.stats, self.ip_pool, self.config.port + 1)
-        await self.mgmt_server.start()
+            # 启动管理服务器
+            self.mgmt_server = ManagementServer(self.stats, self.ip_pool, self.config.port + 1)
+            await self.mgmt_server.start()
 
-        # 打印启动信息
-        self._print_startup_info()
+            # 打印启动信息
+            self._print_startup_info()
 
-        # 等待关闭
-        async with self.proxy_server:
-            await self._shutdown_event.wait()
+            # 等待关闭
+            async with self.proxy_server:
+                await self._shutdown_event.wait()
+        except Exception as e:
+            if not isinstance(e, asyncio.CancelledError):
+                logger.error(f"服务器运行出错: {e}")
+            raise
+        finally:
+            # 确保无论如何都尝试执行基本的清理逻辑
+            # 注意：实际的主清理逻辑在 main() 的 finally 块调用的 stop() 中
+            # 这里是为了双重保险
+            pass
 
     def _signal_handler(self):
         """信号处理"""
@@ -1311,24 +1250,23 @@ def main():
     )
 
     # 服务器配置
-    parser.add_argument('--host', default='0.0.0.0', help='代理绑定地址 (默认: 0.0.0.0，允许局域网访问)')
+    parser.add_argument('--host', default='0.0.0.0', help='代理绑定地址 (默认: 0.0.0.0)')
     parser.add_argument('--port', '-p', type=int, default=8899, help='代理端口 (默认: 8899)')
     parser.add_argument('--pool-size', type=int, default=1000, help='IPv6地址池大小 (默认: 1000)')
-    parser.add_argument('--ipv6-prefix', default='fd00::', help='IPv6地址前缀 (默认: fd00::)')
     parser.add_argument('--rate-limit', type=int, default=0, help='每秒请求限速，0表示不限速 (默认: 0)')
     parser.add_argument('--timeout', type=float, default=30.0, help='连接超时时间 (默认: 30s)')
     parser.add_argument('--debug', action='store_true', help='启用调试日志')
 
-    # 访问控制
-    parser.add_argument('--allow-lan', action='store_true', default=True, help='允许局域网设备访问 (默认: 开启)')
-    parser.add_argument('--deny-lan', action='store_true', help='禁止局域网设备访问 (仅本地127.0.0.1)')
-    parser.add_argument('--allowed-ips', type=str, help='允许的IP白名单，逗号分隔 (如: 192.168.1.0/24,10.0.0.5)')
-    parser.add_argument('--bind-all', action='store_true', help='绑定到所有接口 (等同于 --host 0.0.0.0)')
+    # 指纹混淆配置 (默认开启)
+    parser.add_argument('--disable-fp', action='store_true', help='禁用OS/TCP指纹混淆 (TTL, Window Size, Flow Label)')
+    parser.add_argument('--ttl-range', default='64,128', help='TTL/Hop Limit 随机范围 (默认: 64,128)')
+    parser.add_argument('--win-range', default='65536,131072', help='TCP 窗口大小/缓冲区随机范围 (默认: 65536,131072)')
+    parser.add_argument('--no-flow-label', action='store_true', help='禁用 IPv6 Flow Label 随机化')
 
     # IP配置
     parser.add_argument('--setup-ip', action='store_true', help='配置IPv6地址池到系统（需要root）')
     parser.add_argument('--clear-ip', action='store_true', help='清除配置的IPv6地址（需要root）')
-    parser.add_argument('--ip-count', type=int, default=100, help='配置/清除的IP数量 (默认: 100)')
+    parser.add_argument('--ip-count', type=int, default=1000, help='配置/清除的IP数量 (默认: 1000)')
     parser.add_argument('--interface', '-i', default=None, help='网络接口 (默认: 自动检测)')
 
     args = parser.parse_args()
@@ -1346,31 +1284,33 @@ def main():
         clear_ipv6_addresses(args.interface)
         return
 
-    # 处理bind-all
-    if args.bind_all:
-        args.host = '0.0.0.0'
+    # 解析指纹范围
+    min_ttl, max_ttl = 64, 128
+    try:
+        min_ttl, max_ttl = map(int, args.ttl_range.split(','))
+    except:
+        pass
 
-    # 处理deny-lan
-    if args.deny_lan:
-        args.allow_lan = False
-        args.host = '127.0.0.1'
-
-    # 解析IP白名单
-    allowed_ips = None
-    if args.allowed_ips:
-        allowed_ips = [ip.strip() for ip in args.allowed_ips.split(',')]
+    win_min, win_max = 65536, 131072
+    try:
+        win_min, win_max = map(int, args.win_range.split(','))
+    except:
+        pass
 
     # 服务器模式
     config = ProxyConfig(
         host=args.host,
         port=args.port,
         pool_size=args.pool_size,
-        ipv6_prefix=args.ipv6_prefix,
         interface=args.interface,
         rate_limit=args.rate_limit,
         connection_timeout=args.timeout,
-        allow_lan=args.allow_lan,
-        allowed_ips=allowed_ips
+        enable_fingerprint=not args.disable_fp,
+        min_ttl=min_ttl,
+        max_ttl=max_ttl,
+        randomize_flow_label=not args.no_flow_label,
+        window_size_min=win_min,
+        window_size_max=win_max
     )
 
     server = IPv6ProxyPoolServer(config)
