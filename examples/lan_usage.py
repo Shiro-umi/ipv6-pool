@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IPv6代理池 局域网使用示例
+IPv6代理池 局域网使用示例 (抗特征指纹版)
 
 本机（代理服务器）运行:
     python ipv6_proxy_pool.py --bind-all --allow-lan --port 8899
@@ -9,7 +9,7 @@ IPv6代理池 局域网使用示例
     export HTTP_PROXY=http://<代理服务器IP>:8899
 """
 
-import requests
+import curl_cffi.requests as requests
 import sys
 
 
@@ -33,7 +33,7 @@ def test_lan_proxy():
     proxy_url = f"http://{proxy_ip}:8899"
 
     print("=" * 50)
-    print("IPv6代理池 局域网访问测试")
+    print("IPv6代理池 局域网访问测试 (抗特征指纹版)")
     print("=" * 50)
     print(f"代理服务器: {proxy_url}")
     print()
@@ -44,11 +44,12 @@ def test_lan_proxy():
     }
 
     try:
-        print("测试HTTP请求...")
+        print("测试HTTP请求 (模拟Chrome指纹)...")
         response = requests.get(
-            "http://httpbin.org/get",
+            "https://httpbin.org/get",
             proxies=proxies,
-            timeout=10
+            timeout=10,
+            impersonate="chrome120"
         )
         print(f"✓ 成功! 状态码: {response.status_code}")
         print(f"  响应大小: {len(response.text)} bytes")
@@ -57,11 +58,12 @@ def test_lan_proxy():
         return False
 
     try:
-        print("\n测试HTTPS请求...")
+        print("\n测试HTTPS请求 (模拟Safari指纹)...")
         response = requests.get(
             "https://httpbin.org/get",
             proxies=proxies,
             timeout=10,
+            impersonate="safari15_5",
             verify=False
         )
         print(f"✓ 成功! 状态码: {response.status_code}")
@@ -82,7 +84,7 @@ def print_setup_guide():
 
     guide = f"""
 {'='*60}
-IPv6代理池 局域网使用指南
+IPv6代理池 局域网使用指南 (抗特征指纹版)
 {'='*60}
 
 【代理服务器端（本机）】
@@ -97,26 +99,27 @@ IPv6代理池 局域网使用指南
 
 【局域网客户端】
 
-Linux/macOS:
-   export HTTP_PROXY=http://{proxy_ip}:8899
-   export HTTPS_PROXY=http://{proxy_ip}:8899
-   python your_script.py
+推荐使用 curl_cffi 以对抗 TLS/HTTP2 指纹识别:
+   pip install curl_cffi
 
-Windows (CMD):
-   set HTTP_PROXY=http://{proxy_ip}:8899
-   set HTTPS_PROXY=http://{proxy_ip}:8899
-
-Windows (PowerShell):
-   $env:HTTP_PROXY="http://{proxy_ip}:8899"
-   $env:HTTPS_PROXY="http://{proxy_ip}:8899"
-
-Python代码:
-   import requests
+Python代码示例:
+   import curl_cffi.requests as requests
    proxies = {{
        "http": "http://{proxy_ip}:8899",
        "https": "http://{proxy_ip}:8899"
    }}
-   response = requests.get("https://httpbin.org/get", proxies=proxies)
+   # 使用 impersonate 参数模拟真实浏览器
+   response = requests.get(
+       "https://httpbin.org/get", 
+       proxies=proxies,
+       impersonate="chrome120"
+   )
+   print(response.status_code)
+
+命令行使用:
+   export HTTP_PROXY=http://{proxy_ip}:8899
+   export HTTPS_PROXY=http://{proxy_ip}:8899
+   # 注意: 命令行 curl 可能仍有其特征，建议在程序中使用 curl_cffi
 
 {'='*60}
 """

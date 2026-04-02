@@ -3,7 +3,7 @@
 测试IPv6代理服务器的可用性
 """
 
-import requests
+import curl_cffi.requests as requests
 import sys
 import time
 import socket
@@ -16,17 +16,16 @@ PROXY_URL = f"http://{PROXY_HOST}:{PROXY_PORT}"
 
 # 测试目标URL（使用httpbin.org进行测试）
 TEST_URLS = [
-    "http://httpbin.org/get",
-    "http://httpbin.org/ip",
     "https://httpbin.org/get",
     "https://httpbin.org/ip",
+    "https://ja3er.com/json",  # 测试JA3指纹
 ]
 
 
-def test_proxy_with_requests():
-    """使用requests库测试代理"""
+def test_proxy_with_curl_cffi():
+    """使用curl_cffi库测试代理，模拟Chrome浏览器指纹"""
     print("\n" + "=" * 50)
-    print("测试1: 使用requests库测试代理")
+    print("测试1: 使用curl_cffi库测试代理 (模拟Chrome 120)")
     print("=" * 50)
 
     proxies = {
@@ -42,6 +41,7 @@ def test_proxy_with_requests():
                 url,
                 proxies=proxies,
                 timeout=30,
+                impersonate="chrome120",
                 verify=False
             )
             elapsed = time.time() - start
@@ -50,14 +50,16 @@ def test_proxy_with_requests():
             if response.status_code == 200:
                 content = response.text[:200]
                 print(f"  响应内容: {content}...")
+                if "ja3" in url:
+                    print(f"  JA3指纹: {response.json().get('ja3_hash')}")
         except Exception as e:
             print(f"  失败: {e}")
 
 
-def test_proxy_with_requests_session():
-    """使用requests Session测试代理保持"""
+def test_proxy_with_session():
+    """使用curl_cffi Session测试代理保持"""
     print("\n" + "=" * 50)
-    print("测试2: 使用requests Session测试连接保持")
+    print("测试2: 使用curl_cffi Session测试连接保持")
     print("=" * 50)
 
     proxies = {
@@ -65,13 +67,13 @@ def test_proxy_with_requests_session():
         "https": PROXY_URL,
     }
 
-    session = requests.Session()
+    session = requests.Session(impersonate="chrome120")
 
     for i in range(3):
         try:
             print(f"\n请求 #{i+1}:")
             response = session.get(
-                "http://httpbin.org/get",
+                "https://httpbin.org/get",
                 proxies=proxies,
                 timeout=30
             )
@@ -94,9 +96,10 @@ def test_concurrent_requests():
     def fetch(i):
         try:
             response = requests.get(
-                "http://httpbin.org/get",
+                "https://httpbin.org/get",
                 proxies=proxies,
-                timeout=30
+                timeout=30,
+                impersonate="chrome120"
             )
             return i, response.status_code, None
         except Exception as e:
@@ -118,15 +121,15 @@ def test_concurrent_requests():
 def test_direct_vs_proxy():
     """对比直接请求和代理请求"""
     print("\n" + "=" * 50)
-    print("测试4: 直接请求 vs 代理请求 对比")
+    print("测试4: 直接请求 vs 代理请求 对比 (带JA3指纹验证)")
     print("=" * 50)
 
-    url = "http://httpbin.org/get"
+    url = "https://httpbin.org/get"
 
     print("\n直接请求:")
     try:
         start = time.time()
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, timeout=30, impersonate="chrome120")
         elapsed = time.time() - start
         print(f"  状态码: {response.status_code}")
         print(f"  响应时间: {elapsed:.2f}s")
@@ -139,7 +142,8 @@ def test_direct_vs_proxy():
         response = requests.get(
             url,
             proxies={"http": PROXY_URL, "https": PROXY_URL},
-            timeout=30
+            timeout=30,
+            impersonate="chrome120"
         )
         elapsed = time.time() - start
         print(f"  状态码: {response.status_code}")
@@ -175,15 +179,15 @@ def check_proxy_process():
 
 def main():
     print("=" * 50)
-    print("IPv6代理服务器测试程序")
+    print("IPv6代理服务器测试程序 (支持指纹伪造)")
     print("=" * 50)
 
     if not check_proxy_process():
         sys.exit(1)
 
     try:
-        test_proxy_with_requests()
-        test_proxy_with_requests_session()
+        test_proxy_with_curl_cffi()
+        test_proxy_with_session()
         test_concurrent_requests()
         test_direct_vs_proxy()
 
@@ -198,6 +202,5 @@ def main():
 
 
 if __name__ == '__main__':
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     main()
+

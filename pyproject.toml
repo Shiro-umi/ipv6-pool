@@ -23,15 +23,15 @@ classifiers = [
     "Topic :: System :: Networking",
 ]
 
-# 核心依赖 - 仅标准库
+# 核心依赖
 dependencies = [
-    "requests>=2.32.4",
+    "curl_cffi>=0.7.0",
 ]
 
 [project.optional-dependencies]
 # 可选依赖 - 示例和测试使用
 examples = [
-    "requests>=2.25.0",
+    "curl_cffi>=0.7.0",
 ]
 dev = [
     "pytest>=7.0.0",

@@ -418,6 +418,24 @@ class IPv6AddressPool:
                 if not replaced:
                     logger.error(f"IP汰换失败: {ip} 释放后无法生成有效新IP，地址池永久缩小")
 
+    async def cleanup(self):
+        """清理所有已安装到网卡的IP"""
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            total_to_remove = list(self._available) + list(self._in_use)
+            if not total_to_remove:
+                return
+
+            logger.info(f"正在从接口 {self.interface} 清理 {len(total_to_remove)} 个IPv6地址...")
+            removed = 0
+            for ip in total_to_remove:
+                if await loop.run_in_executor(None, self._remove_ip_from_interface_sync, ip):
+                    removed += 1
+
+            self._available.clear()
+            self._in_use.clear()
+            logger.info(f"清理完成: 成功删除 {removed}/{len(total_to_remove)} 个地址")
+
     def get_stats(self) -> dict:
         """获取池统计"""
         with self._lock:
@@ -1141,6 +1159,11 @@ IPv6池大小: {self.config.pool_size}
             await self.proxy_server.wait_closed()
         if self.mgmt_server:
             self.mgmt_server.stop()
+
+        # 清理IP池中的网卡地址
+        if self.ip_pool:
+            await self.ip_pool.cleanup()
+
         logger.info("服务器已停止")
 
 
