@@ -206,11 +206,15 @@ main() {
     CMD_ARGS="--port $PORT --pool-size $POOL_SIZE --interface $INTERFACE"
 
     if [[ "$BIND_ALL" == true ]]; then
-        CMD_ARGS="$CMD_ARGS --bind-all"
+        CMD_ARGS="$CMD_ARGS --host 0.0.0.0"
+    else
+        CMD_ARGS="$CMD_ARGS --host 127.0.0.1"
     fi
 
     if [[ "$ALLOW_LAN" == true ]]; then
         CMD_ARGS="$CMD_ARGS --allow-lan"
+    else
+        CMD_ARGS="$CMD_ARGS --deny-lan"
     fi
 
     # 添加额外参数
@@ -223,7 +227,7 @@ main() {
     echo "  端口: $PORT"
     echo "  地址池: $POOL_SIZE"
     echo "  网卡: $INTERFACE"
-    echo "  命令: $UV_PATH run python ipv6_proxy_pool.py $CMD_ARGS"
+    echo "  命令: $UV_PATH run python -m ipv6_proxy_pool.cli.main $CMD_ARGS"
     echo ""
 
     if [[ "$ALLOW_LAN" == true ]]; then
@@ -242,7 +246,7 @@ main() {
     echo ""
 
     # 使用 uv run 启动
-    exec "$UV_PATH" run python ipv6_proxy_pool.py $CMD_ARGS
+    exec "$UV_PATH" run python -m ipv6_proxy_pool.cli.main $CMD_ARGS
 }
 
 # 运行

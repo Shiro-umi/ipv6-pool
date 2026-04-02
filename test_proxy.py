@@ -170,7 +170,7 @@ def check_proxy_process():
         else:
             print(f"✗ 代理服务器未运行: {PROXY_HOST}:{PROXY_PORT}")
             print("\n请先启动代理服务器:")
-            print(f"  python ipv6_proxy.py --port {PROXY_PORT}")
+            print(f"  ipv6-proxy-pool --port {PROXY_PORT}")
             return False
     except Exception as e:
         print(f"✗ 检查失败: {e}")
