@@ -27,7 +27,6 @@ import struct
 import subprocess
 import sys
 import time
-import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -233,7 +232,7 @@ class IPv6AddressPool:
         self.pool_size = pool_size
         self._available: List[str] = []
         self._in_use: Set[str] = set()
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
         self._setup_mode = False
 
         # 自动检测接口（如果未指定）
@@ -309,7 +308,7 @@ class IPv6AddressPool:
         """将可用池中的地址批量添加到网卡"""
         failed = 0
         for ip in list(self._available):
-            if not self._add_ip_to_interface(ip):
+            if not self._add_ip_to_interface_sync(ip):
                 self._available.remove(ip)
                 failed += 1
         total = len(self._available)
@@ -317,8 +316,8 @@ class IPv6AddressPool:
             logger.warning(f"地址池初始化：{failed} 个地址添加到网卡失败，可用池: {total}")
         logger.info(f"地址池初始化完成：{total}/{self.pool_size} 个地址已安装到 {self.interface}")
 
-    def _add_ip_to_interface(self, ip: str) -> bool:
-        """将IP添加到网卡"""
+    def _add_ip_to_interface_sync(self, ip: str) -> bool:
+        """将IP添加到网卡（同步版本，请在执行器中调用）"""
         try:
             # 优先尝试 nodad 以跳过重复地址检测，加快可用
             result = subprocess.run(
@@ -347,8 +346,8 @@ class IPv6AddressPool:
             logger.warning(f"添加IP {ip} 到网卡失败: {e}")
             return False
 
-    def _remove_ip_from_interface(self, ip: str) -> bool:
-        """从网卡删除IP"""
+    def _remove_ip_from_interface_sync(self, ip: str) -> bool:
+        """从网卡删除IP（同步版本，请在执行器中调用）"""
         try:
             result = subprocess.run(
                 ['ip', '-6', 'addr', 'del', f'{ip}/128', 'dev', self.interface],
@@ -361,13 +360,15 @@ class IPv6AddressPool:
             logger.warning(f"从网卡删除IP {ip} 失败: {e}")
             return False
 
-    def acquire(self) -> Optional[str]:
+    async def acquire(self) -> Optional[str]:
         """获取一个可用的IPv6地址"""
-        with self._lock:
+        loop = asyncio.get_running_loop()
+        async with self._lock:
             failed_count = 0
             while self._available:
                 ip = self._available.pop(0)
-                if self._add_ip_to_interface(ip):
+                success = await loop.run_in_executor(None, self._add_ip_to_interface_sync, ip)
+                if success:
                     self._in_use.add(ip)
                     if failed_count > 0:
                         logger.warning(f"acquire: 跳过 {failed_count} 个无法添加的IP后，成功使用 {ip}")
@@ -380,32 +381,42 @@ class IPv6AddressPool:
                 logger.error(f"acquire: 地址池耗尽，共 {failed_count} 个IP无法添加到网卡")
             return None
 
-    def release(self, ip: str):
+    async def release(self, ip: Optional[str]):
         """释放IPv6地址 - 即弃模式：从网卡删除旧IP，生成新IP并添加"""
-        with self._lock:
-            if ip in self._in_use:
-                self._in_use.discard(ip)
+        if not ip or ip == '::' or ip.startswith('0.0.0.0') or ip.startswith('0.0'):
+            return
 
-                # 从网卡删除旧IP
-                if ip != '::' and not ip.startswith('0.0.0.0') and not ip.startswith('0.0'):
-                    self._remove_ip_from_interface(ip)
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            if ip not in self._in_use:
+                return
+            self._in_use.discard(ip)
 
-                # 生成新IP
-                new_ip = self._generate_ip()
+            # 从网卡删除旧IP
+            await loop.run_in_executor(None, self._remove_ip_from_interface_sync, ip)
 
-                # 将新IP添加到网卡
-                if self._add_ip_to_interface(new_ip):
-                    self._available.append(new_ip)
-                    logger.debug(f"IP汰换: {ip} -> {new_ip}")
-                else:
-                    # 如果添加失败，尝试生成另一个
-                    logger.warning(f"添加新IP失败，尝试另一个...")
-                    for _ in range(5):  # 最多尝试5次
-                        new_ip = self._generate_ip()
-                        if self._add_ip_to_interface(new_ip):
-                            self._available.append(new_ip)
-                            logger.debug(f"IP汰换: {ip} -> {new_ip} (重试)")
-                            break
+            # 生成新IP
+            new_ip = self._generate_ip()
+
+            # 将新IP添加到网卡
+            success = await loop.run_in_executor(None, self._add_ip_to_interface_sync, new_ip)
+            if success:
+                self._available.append(new_ip)
+                logger.debug(f"IP汰换: {ip} -> {new_ip}")
+            else:
+                # 如果添加失败，尝试生成另一个
+                logger.warning(f"添加新IP失败，尝试另一个...")
+                replaced = False
+                for _ in range(5):  # 最多尝试5次
+                    new_ip = self._generate_ip()
+                    success = await loop.run_in_executor(None, self._add_ip_to_interface_sync, new_ip)
+                    if success:
+                        self._available.append(new_ip)
+                        logger.debug(f"IP汰换: {ip} -> {new_ip} (重试)")
+                        replaced = True
+                        break
+                if not replaced:
+                    logger.error(f"IP汰换失败: {ip} 释放后无法生成有效新IP，地址池永久缩小")
 
     def get_stats(self) -> dict:
         """获取池统计"""
@@ -455,9 +466,6 @@ class RateLimiter:
 
 
 # ============== 连接管理器 ==============
-
-from functools import lru_cache
-import time
 
 class IPv6ConnectivityCache:
     """IPv6连通性缓存 - 带过期时间的LRU缓存"""
@@ -522,14 +530,14 @@ class OutboundConnector:
             return await self._connect_ipv4(host, port)
         else:
             # 无缓存，检查是否有可用IPv6地址
-            test_ip = self.ip_pool.acquire()
+            test_ip = await self.ip_pool.acquire()
             if test_ip is None:
                 # 没有可用的IPv6地址，直接使用IPv4
                 logger.debug(f"无可用IPv6地址，直接使用IPv4: {host}:{port}")
                 return await self._connect_ipv4(host, port)
 
             # 有IPv6地址，优先尝试
-            self.ip_pool.release(test_ip)
+            await self.ip_pool.release(test_ip)
             try:
                 return await self._try_ipv6_first(host, port)
             except Exception as e:
@@ -539,14 +547,14 @@ class OutboundConnector:
 
     async def _try_ipv6_first(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
         """优先尝试IPv6连接，快速失败"""
-        local_v6_addr = self.ip_pool.acquire()
+        local_v6_addr = await self.ip_pool.acquire()
         if not local_v6_addr:
             local_v6_addr = "::"
 
         try:
             # 获取IPv6地址信息
             addr_info = await asyncio.wait_for(
-                asyncio.get_event_loop().getaddrinfo(
+                asyncio.get_running_loop().getaddrinfo(
                     host, port,
                     family=socket.AF_INET6,  # 只获取IPv6
                     type=socket.SOCK_STREAM
@@ -563,7 +571,7 @@ class OutboundConnector:
 
             try:
                 await asyncio.wait_for(
-                    asyncio.get_event_loop().sock_connect(sock, target_addr),
+                    asyncio.get_running_loop().sock_connect(sock, target_addr),
                     timeout=3.0
                 )
 
@@ -581,7 +589,7 @@ class OutboundConnector:
                 raise
 
         except Exception as e:
-            self.ip_pool.release(local_v6_addr)
+            await self.ip_pool.release(local_v6_addr)
             # IPv6失败，记录缓存并抛出让上层回退
             self._ipv6_cache.set(host, False)
             raise
@@ -589,11 +597,12 @@ class OutboundConnector:
     async def _connect_ipv4(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
         """使用IPv4连接（回退方案）"""
         v4_display = "0.0.0.0"
+        sock = None
 
         try:
             # 获取IPv4地址信息
             addr_info = await asyncio.wait_for(
-                asyncio.get_event_loop().getaddrinfo(
+                asyncio.get_running_loop().getaddrinfo(
                     host, port,
                     family=socket.AF_INET,  # 只获取IPv4
                     type=socket.SOCK_STREAM
@@ -611,7 +620,7 @@ class OutboundConnector:
 
             # 连接目标
             await asyncio.wait_for(
-                asyncio.get_event_loop().sock_connect(sock, target_addr),
+                asyncio.get_running_loop().sock_connect(sock, target_addr),
                 timeout=self.config.connection_timeout
             )
 
@@ -622,7 +631,8 @@ class OutboundConnector:
             return reader, writer, v4_display
 
         except Exception as e:
-            sock.close()
+            if sock:
+                sock.close()
             raise ConnectionError(f"连接失败 {host}:{port} - {e}")
 
     def _create_ipv6_socket(self, bind_addr: str) -> socket.socket:
@@ -757,9 +767,9 @@ class HTTPProxyProtocol(asyncio.Protocol):
 
     def data_received(self, data: bytes):
         """接收客户端数据"""
-        if self.state == 'relaying':
-            # 隧道模式，直接转发
-            if self.outbound_writer:
+        if self.state in ('relaying', 'handshaking'):
+            # 隧道模式或正在建立连接，直接转发（如relay）或忽略（如handshaking）
+            if self.state == 'relaying' and self.outbound_writer:
                 self.outbound_writer.write(data)
                 self.bytes_sent += len(data)
             return
@@ -778,8 +788,11 @@ class HTTPProxyProtocol(asyncio.Protocol):
             headers_end = self.buffer.index(b'\r\n\r\n') + 4
             header_data = self.buffer[:headers_end]
             body_data = self.buffer[headers_end:]
+            self.state = 'handshaking'
             self._handle_request(header_data, body_data)
         except Exception as e:
+            if self.state == 'handshaking':
+                self.state = 'initial'
             logger.error(f"处理请求失败: {e}")
             self._send_error(400, f"Bad Request: {e}")
 
@@ -818,6 +831,7 @@ class HTTPProxyProtocol(asyncio.Protocol):
         """解析CONNECT URL"""
         if ':' in url:
             host, port_str = url.rsplit(':', 1)
+            host = host.strip('[]')
             return host, int(port_str)
         return url, 443
 
@@ -947,8 +961,8 @@ class HTTPProxyProtocol(asyncio.Protocol):
         self.state = 'closed'
 
         # 释放IP
-        if self.used_ip and self.used_ip not in ('0.0.0.0', '::'):
-            self.connector.ip_pool.release(self.used_ip)
+        if self.used_ip:
+            asyncio.create_task(self.connector.ip_pool.release(self.used_ip))
 
         # 关闭连接
         if self.outbound_writer:
@@ -981,7 +995,7 @@ class ManagementServer:
 
     async def start(self):
         """启动管理服务器"""
-        self.server = await asyncio.get_event_loop().create_server(
+        self.server = await asyncio.get_running_loop().create_server(
             lambda: ManagementProtocol(self.stats, self.ip_pool),
             '127.0.0.1', self.port
         )
@@ -1061,7 +1075,7 @@ class IPv6ProxyPoolServer:
 
     async def start(self):
         """启动服务器"""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # 设置信号处理
         for sig in (signal.SIGINT, signal.SIGTERM):
